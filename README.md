@@ -13,7 +13,7 @@ generates optimized C code depending on the target architecture.
 Clone the repository and install the package in editable mode.
 ```bash
 # Create a new conda environment (optional).
-conda create --name groundwater python
+conda create --name groundwater "python<=3.12"
 conda activate groundwater
 
 # Clone the repository and install the package in your Python environment.
