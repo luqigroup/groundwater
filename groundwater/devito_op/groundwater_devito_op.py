@@ -14,6 +14,10 @@ from devito import (
     grad,
     initialize_function,
     solve,
+    Dimension,
+    Abs,
+    Inc,
+    Max
 )
 
 # Set Devito logging level to ERROR to suppress excessive output
@@ -63,6 +67,15 @@ class GroundwaterEquation:
         # Source term function f(x)
         self.f = Function(name="f", grid=self.grid, space_order=2)
 
+        # Static p
+        self.p0 = Function(name="p0", grid=self.grid, space_order=2)
+
+        # Gradient function
+        self.gradient = Function(name="gradient", grid=self.grid, space_order=2)
+
+        # Place holder to check convergence
+        self.r = Function(name="r", dimensions=(Dimension('rdim'),), shape=(1,))
+
         # Adjoint variable lambda(x,t) and adjoint source f_adj(x)
         self.lambda_adj = TimeFunction(
             name="lambda_adj",
@@ -72,21 +85,24 @@ class GroundwaterEquation:
         self.f_adj = Function(name="f_adj", grid=self.grid, space_order=2)
 
         # Set up forward and adjoint PDE operators
-        self.fwd_op = self.setup_foward_pde(self.p, self.u, self.f)
+        self.fwd_op = {
+            False: self.setup_foward_pde(self.p, self.u, self.f),
+            True: self.setup_foward_pde(self.p, self.u, self.f, lin=True)
+        }
         self.adj_op = self.setup_adjoint_pde(
             self.lambda_adj,
             self.u,
             self.f_adj,
         )
-
-        # Gradient function
-        self.gradient = Function(name="gradient", grid=self.grid, space_order=2)
+        self.lin_f_op = self.setup_linf_op(self.p0, self.u, self.gradient, self.f)
+        self.op_gradient = None
 
     def setup_foward_pde(
         self,
         p: TimeFunction,
         u: Function,
         f: Function,
+        lin: bool = False,
     ) -> Operator:
         """
         Set up the forward PDE operator for the pressure equation.
@@ -100,6 +116,7 @@ class GroundwaterEquation:
             Operator: Devito operator for forward PDE time-stepping.
         """
         x, y = self.grid.dimensions
+        mx, my = self.grid.shape[0] // 3, self.grid.shape[1] // 3
         t = self.grid.stepping_dim
 
         # The PDE: -∇ · (e^u(x) ∇p(x)) = f
@@ -108,18 +125,37 @@ class GroundwaterEquation:
         update = Eq(p.forward, stencil)
 
         # Boundary conditions
-        bc = [
-            # p(x)|x2=0 = x1
-            Eq(p[t + 1, x, 0], x * self.grid.spacing[0]),
-            # p(x)|x2=1 = 1 - x1
-            Eq(p[t + 1, x, y.symbolic_max], 1.0 - x * self.grid.spacing[0]),
-            # ∂p(x)/∂x1|x1=0 = 0
-            Eq(p[t + 1, -1, y], p[t + 1, 0, y]),
-            # ∂p(x)/∂x1|x1=1 = 0
-            Eq(p[t + 1, x.symbolic_max + 1, y], p[t + 1, x.symbolic_max, y]),
-        ]
+        if not lin:
+            bc = [
+                # p(x)|x2=0 = x1
+                Eq(p[t + 1, x, 0], x * self.grid.spacing[0]),
+                # p(x)|x2=1 = 1 - x1
+                Eq(p[t + 1, x, y.symbolic_max], 1.0 - x * self.grid.spacing[0]),
+                # ∂p(x)/∂x1|x1=0 = 0
+                Eq(p[t + 1, -1, y], p[t + 1, 0, y]),
+                # ∂p(x)/∂x1|x1=1 = 0
+                Eq(p[t + 1, x.symbolic_max + 1, y], p[t + 1, x.symbolic_max, y]),
+            ]
+        else:
+            bc = [
+                # p(x)|x2=0 = 0
+                Eq(p[t + 1, x, 0], 0),
+                # p(x)|x2=1 = 0
+                Eq(p[t + 1, x, y.symbolic_max], 0),
+                # ∂p(x)/∂x1|x1=0 = 0
+                Eq(p[t + 1, -1, y], p[t + 1, 0, y]),
+                # ∂p(x)/∂x1|x1=1 = 0
+                Eq(p[t + 1, x.symbolic_max + 1, y], p[t + 1, x.symbolic_max, y]),
+            ]
 
-        return Operator([update] + bc)
+        # Compute error in the middle
+        residual = [Eq(self.r[0], 0),
+                    Eq(self.r[0], Abs(equation_p.lhs.evaluate.subs({t: 1, x: mx, y: my}) -
+                                      equation_p.rhs.subs({x: mx, y: my})))]
+
+        op = Operator([update] + bc + residual)
+
+        return op
 
     def setup_adjoint_pde(
         self,
@@ -165,11 +201,26 @@ class GroundwaterEquation:
 
         return Operator([update_adj] + bc_adj)
 
+    def setup_linf_op(self, p: Function, u: Function, du: Function, f: Function) -> Operator:
+        """
+        Set up the linearized forward PDE operator for the pressure equation.
+
+        Args:
+            p (TimeFunction): Time-dependent pressure function.
+            u (Function): Log-permeability function.
+
+        Returns:
+            Operator: Devito operator for linearized forward PDE time-stepping.
+        """
+        # Linearized PDE f:  ∇ · (e^(u(x)) du(x) ∇p)
+        return Operator(Eq(f,  div(exp(u) * du * grad(p, shift=0.5), shift=-0.5)))
+
     def eval_fwd_op(
         self,
         f: np.ndarray,
         u: np.ndarray,
         time_steps: int = NUM_PSEUDO_TIMESTEPS,
+        lin: bool = False,
         return_array: bool = True,
     ) -> np.ndarray:
         """
@@ -187,10 +238,12 @@ class GroundwaterEquation:
         Returns:
             np.ndarray: Pressure field after time-stepping.
         """
-        self.f.data[:] = f[:]
+        initialize_function(self.f, f, 0)
         initialize_function(self.u, u, 0)
         self.p.data_with_halo.fill(0.0)
-        self.fwd_op(time=time_steps)
+        self.fwd_op[lin](time=time_steps)
+
+        print(f"Residual (lin: {lin}) at last iteration: {self.r.data[0]}")
 
         if return_array:
             return np.array(self.p.data[1])
@@ -220,7 +273,7 @@ class GroundwaterEquation:
         Returns:
             np.ndarray: Adjoint variable field after time-stepping.
         """
-        self.f_adj.data[:] = residual[:]
+        initialize_function(self.f_adj, residual, 0)
         initialize_function(self.u, u, 0)
         self.lambda_adj.data_with_halo.fill(0.0)
         self.adj_op(time=time_steps)
@@ -229,6 +282,34 @@ class GroundwaterEquation:
             return np.array(self.lambda_adj.data[1])
         else:
             return self.lambda_adj
+
+    def eval_f_lin(
+        self,
+        u: np.ndarray,
+        du: np.ndarray,
+        p_fwd: np.ndarray,
+        return_array: bool = True) -> np.ndarray:
+        """
+        Evaluate the linearized forcing term for the forward PDE operator.
+        Args:
+            f (np.ndarray): Source term array.
+            u (np.ndarray): Log-permeability array.
+            du (np.ndarray): Perturbation in the log-permeability field.
+            p_fwd (np.ndarray): Forward pressure field.
+        Returns:
+            np.ndarray: Linearized forcing term.
+        """
+        initialize_function(self.u, u, 0)
+        initialize_function(self.gradient, du, 0)
+        self.f.data_with_halo.fill(0.0)
+        initialize_function(self.p0, p_fwd, 0)
+
+        self.lin_f_op()
+
+        if return_array:
+            return np.array(self.f.data)
+        else:
+            return self.f
 
     def compute_gradient(
         self, u0: np.ndarray, residual: np.ndarray, p_fwd: TimeFunction
@@ -249,25 +330,45 @@ class GroundwaterEquation:
                 permeability field.
         """
         self.gradient.data_with_halo.fill(0.0)
+        initialize_function(self.u, u0, 0)
 
         # Evaluate adjoint variable
         lambda_adj = self.eval_adj_op(u0, residual, return_array=False)
 
         # -e^u ∇λ · ∇p term for gradient computation
-        t = self.grid.stepping_dim
-        grad_lambda = grad(lambda_adj, shift=0.5)._subs(t, 1)
-        grad_p = grad(p_fwd, shift=0.5)._subs(t, 1)
-
-        # Gradient of the objective function with respect to u
-        gradient_eq = Eq(
-            self.gradient, -exp(self.u) * (grad_lambda.dot(grad_p))
-        )
-        op_gradient = Operator(gradient_eq)
+        if self.op_gradient is None:
+            t = self.grid.stepping_dim
+            # Gradient of the objective function with respect to u
+            grad_lambda = grad(lambda_adj, shift=0.5)._subs(t, 1)
+            grad_p = grad(p_fwd, shift=0.5)._subs(t, 1)
+            gradient_eq = Eq(
+                self.gradient, -exp(self.u) * (grad_lambda.dot(grad_p))
+            )
+            self.op_gradient = Operator(gradient_eq)
 
         # Compute the gradient
-        op_gradient()
+        self.op_gradient()
 
-        return self.gradient.data
+        return np.array(self.gradient.data)
+
+    def compute_linearization(self,
+        f: np.ndarray,
+        u: np.ndarray,
+        du: np.ndarray,
+        time_steps: int = NUM_PSEUDO_TIMESTEPS,
+        return_array: bool = True,
+    ) -> np.ndarray:
+        # First pass: Compute the forward model with the original u
+        p_fwd = self.eval_fwd_op(f, u, time_steps)
+
+        # Compute linearized forcing
+        f_lin = self.eval_f_lin(u, du, p_fwd)
+
+        # Second pass: Compute the forward model with the linearized forcing
+        p_fwd_lin = self.eval_fwd_op(f_lin, u, time_steps, lin=True,
+                                     return_array=return_array)
+
+        return p_fwd_lin
 
 
 class GroundwaterLayer(torch.autograd.Function):
